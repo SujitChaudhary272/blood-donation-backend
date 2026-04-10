@@ -45,6 +45,14 @@ const ensureProvider = (user, provider) => {
   user.providers = Array.from(providers);
 };
 
+const isGoogleSignupIncomplete = (user) => {
+  if (!user || !hasProvider(user, 'google')) {
+    return false;
+  }
+
+  return !user.name || !user.phone || !hasProvider(user, 'local');
+};
+
 const serializeUser = (user) => ({
   _id: user._id,
   name: user.name,
@@ -56,6 +64,7 @@ const serializeUser = (user) => ({
   provider: user.authProvider,
   googleId: user.googleId || null,
   profilePhoto: user.profilePhoto || null,
+  needsProfileCompletion: isGoogleSignupIncomplete(user),
   createdAt: user.createdAt
 });
 
@@ -78,12 +87,92 @@ const formatExistingAccountMessage = (user) => {
   return `Account already exists as ${accountRole}. Please login.`;
 };
 
+const validatePhoneNumber = (phone) => {
+  const phoneRegex = /^[0-9]{10}$/;
+  return phoneRegex.test(phone);
+};
+
+const validatePasswordStrength = (password) => {
+  return typeof password === 'string' && password.length >= 6;
+};
+
 const sendSignupAccountExistsResponse = (res) => {
   return res.status(409).json({
     success: false,
     code: 'ACCOUNT_EXISTS',
     message: 'Account already exists. Please log in.'
   });
+};
+
+const getDuplicateKeyField = (error) => {
+  const keyPatternField = Object.keys(error?.keyPattern || {})[0];
+  if (keyPatternField) {
+    return keyPatternField;
+  }
+
+  const keyValueField = Object.keys(error?.keyValue || {})[0];
+  if (keyValueField) {
+    return keyValueField;
+  }
+
+  const message = String(error?.message || '');
+
+  if (message.includes('email')) {
+    return 'email';
+  }
+
+  if (message.includes('phone')) {
+    return 'phone';
+  }
+
+  if (message.includes('googleId')) {
+    return 'googleId';
+  }
+
+  return null;
+};
+
+const handleSignupPersistenceError = (error, res, role) => {
+  if (error?.code === 11000) {
+    const duplicateField = getDuplicateKeyField(error);
+
+    if (duplicateField === 'email') {
+      return sendSignupAccountExistsResponse(res);
+    }
+
+    if (duplicateField === 'phone') {
+      return res.status(400).json({
+        success: false,
+        message: `A ${role} account already exists with this mobile number. Please login instead.`
+      });
+    }
+
+    return res.status(409).json({
+      success: false,
+      message: 'An account with these details already exists. Please login instead.'
+    });
+  }
+
+  if (error?.name === 'ValidationError') {
+    const validationMessage = Object.values(error.errors || {})
+      .map((validationError) => validationError.message)
+      .filter(Boolean)
+      .join(', ');
+
+    return res.status(400).json({
+      success: false,
+      message: validationMessage || 'Please provide valid signup details'
+    });
+  }
+
+  if (error?.name === 'CastError') {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid signup data received'
+    });
+  }
+
+  return null;
 };
 
 const validateAndCreateUser = async ({ name, email, password, phone, role, profilePhoto }, res) => {
@@ -109,15 +198,14 @@ const validateAndCreateUser = async ({ name, email, password, phone, role, profi
     });
   }
 
-  const phoneRegex = /^[0-9]{10}$/;
-  if (!phoneRegex.test(phone)) {
+  if (!validatePhoneNumber(phone)) {
     return res.status(400).json({
       success: false,
       message: 'Please provide a valid 10-digit phone number'
     });
   }
 
-  if (password.length < 6) {
+  if (!validatePasswordStrength(password)) {
     return res.status(400).json({
       success: false,
       message: 'Password must be at least 6 characters long'
@@ -253,10 +341,8 @@ router.post('/signup/donor', async (req, res) => {
     return await validateAndCreateUser({ ...req.body, role: 'donor' }, res);
   } catch (error) {
     console.error('Donor signup error:', error);
-
-    if (error.code === 11000 && error.keyPattern?.email) {
-      return sendSignupAccountExistsResponse(res);
-    }
+    const handledResponse = handleSignupPersistenceError(error, res, 'donor');
+    if (handledResponse) return handledResponse;
 
     return res.status(500).json({
       success: false,
@@ -271,10 +357,8 @@ router.post('/donor/signup', async (req, res) => {
     return await validateAndCreateUser({ ...req.body, role: 'donor' }, res);
   } catch (error) {
     console.error('Donor signup error:', error);
-
-    if (error.code === 11000 && error.keyPattern?.email) {
-      return sendSignupAccountExistsResponse(res);
-    }
+    const handledResponse = handleSignupPersistenceError(error, res, 'donor');
+    if (handledResponse) return handledResponse;
 
     return res.status(500).json({
       success: false,
@@ -289,10 +373,8 @@ router.post('/signup/receiver', async (req, res) => {
     return await validateAndCreateUser({ ...req.body, role: 'receiver' }, res);
   } catch (error) {
     console.error('Receiver signup error:', error);
-
-    if (error.code === 11000 && error.keyPattern?.email) {
-      return sendSignupAccountExistsResponse(res);
-    }
+    const handledResponse = handleSignupPersistenceError(error, res, 'receiver');
+    if (handledResponse) return handledResponse;
 
     return res.status(500).json({
       success: false,
@@ -307,10 +389,8 @@ router.post('/receiver/signup', async (req, res) => {
     return await validateAndCreateUser({ ...req.body, role: 'receiver' }, res);
   } catch (error) {
     console.error('Receiver signup error:', error);
-
-    if (error.code === 11000 && error.keyPattern?.email) {
-      return sendSignupAccountExistsResponse(res);
-    }
+    const handledResponse = handleSignupPersistenceError(error, res, 'receiver');
+    if (handledResponse) return handledResponse;
 
     return res.status(500).json({
       success: false,
@@ -380,20 +460,8 @@ router.post('/signup', async (req, res) => {
     return await validateAndCreateUser(req.body, res);
   } catch (error) {
     console.error('Signup error:', error);
-    
-    // Handle duplicate key error (MongoDB unique constraint)
-    if (error.code === 11000) {
-      const field = Object.keys(error.keyPattern || {})[0];
-      const duplicateRole = req.body.role || 'user';
-      if (field === 'email') {
-        return sendSignupAccountExistsResponse(res);
-      }
-
-      return res.status(400).json({
-        success: false,
-        message: `A ${duplicateRole} account already exists with this mobile number. Please login instead.`
-      });
-    }
+    const handledResponse = handleSignupPersistenceError(error, res, req.body.role || 'user');
+    if (handledResponse) return handledResponse;
 
     res.status(500).json({ 
       success: false,
@@ -490,7 +558,7 @@ router.post('/google', async (req, res) => {
         shouldSave = true;
       }
 
-      if (!user.profilePhoto && googleProfile.picture) {
+      if (googleProfile.picture && user.profilePhoto !== googleProfile.picture) {
         user.profilePhoto = googleProfile.picture;
         shouldSave = true;
       }
@@ -567,9 +635,7 @@ router.put('/update-profile', protect, async (req, res) => {
     const fieldsToUpdate = {};
     if (name) fieldsToUpdate.name = name;
     if (phone) {
-      // Validate phone format
-      const phoneRegex = /^[0-9]{10}$/;
-      if (!phoneRegex.test(phone)) {
+      if (!validatePhoneNumber(phone)) {
         return res.status(400).json({
           success: false,
           message: 'Please provide a valid 10-digit phone number'
@@ -590,18 +656,7 @@ router.put('/update-profile', protect, async (req, res) => {
     res.json({
       success: true,
       message: 'Profile updated successfully',
-      user: {
-        _id: user._id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-        providers: getProviders(user),
-        authProvider: user.authProvider,
-        provider: user.authProvider,
-        googleId: user.googleId || null,
-        profilePhoto: user.profilePhoto || null
-      }
+      user: serializeUser(user)
     });
   } catch (error) {
     console.error('Update profile error:', error);
@@ -626,7 +681,7 @@ router.put('/change-password', protect, async (req, res) => {
       });
     }
 
-    if (newPassword.length < 6) {
+    if (!validatePasswordStrength(newPassword)) {
       return res.status(400).json({
         success: false,
         message: 'New password must be at least 6 characters long'
@@ -675,6 +730,99 @@ router.put('/change-password', protect, async (req, res) => {
     });
   }
 });
+
+const completeGoogleProfile = async (req, res) => {
+  try {
+    const { name, phone, password, confirmPassword } = req.body;
+    const user = await User.findById(req.user._id).select('+password');
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    if (!hasProvider(user, 'google')) {
+      return res.status(400).json({
+        success: false,
+        message: 'This action is only available for Google accounts'
+      });
+    }
+
+    if (!name || !phone || !password || !confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide full name, phone number, password, and confirm password'
+      });
+    }
+
+    if (password !== confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Passwords do not match'
+      });
+    }
+
+    if (!validatePhoneNumber(phone)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide a valid 10-digit phone number'
+      });
+    }
+
+    if (!validatePasswordStrength(password)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters long'
+      });
+    }
+
+    const phoneOwner = await User.findOne({
+      phone,
+      role: user.role,
+      _id: { $ne: user._id }
+    });
+
+    if (phoneOwner) {
+      return res.status(400).json({
+        success: false,
+        message: `A ${user.role} account already exists with this mobile number. Please use a different number.`
+      });
+    }
+
+    user.name = name.trim();
+    user.phone = phone;
+    user.password = password;
+    ensureProvider(user, 'local');
+    await user.save();
+
+    return res.json({
+      success: true,
+      message: 'Profile completed successfully. You can now log in with email/password or Google.',
+      user: serializeUser(user)
+    });
+  } catch (error) {
+    console.error('Complete Google profile error:', error);
+
+    const handledResponse = handleSignupPersistenceError(error, res, req.user?.role || 'user');
+    if (handledResponse) return handledResponse;
+
+    return res.status(500).json({
+      success: false,
+      message: 'Server error completing Google signup'
+    });
+  }
+};
+
+// @route   PUT /api/auth/google/complete-profile
+// @desc    Complete Google signup by adding required local profile fields
+// @access  Private
+router.put('/google/complete-profile', protect, completeGoogleProfile);
+
+// Backward-compatible aliases for environments using older frontend/backend route names.
+router.put('/google/complete-signup', protect, completeGoogleProfile);
+router.put('/complete-google-signup', protect, completeGoogleProfile);
 
 // @route   DELETE /api/auth/delete-account
 // @desc    Delete user account and all related data

@@ -629,6 +629,15 @@ router.delete('/:id([0-9a-fA-F]{24})', protect, async (req, res) => {
       });
     }
 
+    if (request.receiver && String(request.receiver) === String(req.user._id)) {
+      if (request.status === 'accepted' || request.status === 'completed') {
+        return res.status(400).json({
+          success: false,
+          message: 'Accepted or completed donor requests cannot be deleted'
+        });
+      }
+    }
+
     await request.deleteOne();
 
     res.json({
